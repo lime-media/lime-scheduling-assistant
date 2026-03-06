@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Lime Media Scheduling Assistant</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f1f5f9; height: 100vh; display: flex; flex-direction: column; }
+
+    #header { background: #15803d; color: white; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    #header h1 { font-size: 17px; font-weight: 700; }
+    #header p  { font-size: 11px; opacity: 0.75; margin-top: 2px; }
+    #badges    { display: flex; gap: 6px; flex-wrap: wrap; }
+    .badge     { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; color: white; }
+
+    #messages  { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+    .bubble    { max-width: 78%; padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.65; white-space: pre-wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .assistant { background: white; color: #1e293b; align-self: flex-start; border-bottom-left-radius: 3px; }
+    .user      { background: #15803d; color: white; align-self: flex-end; border-bottom-right-radius: 3px; }
+
+    #suggestions { padding: 0 20px 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .suggestion  { font-size: 12px; padding: 6px 12px; border-radius: 20px; border: 1px solid #cbd5e1; background: white; cursor: pointer; color: #475569; }
+    .suggestion:hover { background: #f8fafc; }
+
+    #inputbar  { padding: 12px 20px; background: white; border-top: 1px solid #e2e8f0; display: flex; gap: 10px; flex-shrink: 0; }
+    #userinput { flex: 1; padding: 10px 14px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 14px; outline: none; }
+    #sendbtn   { padding: 10px 22px; background: #15803d; color: white; border: none; border-radius: 10px; font-weight: 600; font-size: 14px; cursor: pointer; }
+    #sendbtn:disabled { background: #86efac; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+<div id="header">
+  <div>
+    <h1>🚛 Lime Media Scheduling Assistant</h1>
+    <p id="dataStatus">Data loads on first question</p>
+  </div>
+  <div id="badges">
+    <span class="badge" style="background:#16a34a">Scheduled</span>
+    <span class="badge" style="background:#dc2626">Committed</span>
+    <span class="badge" style="background:#ca8a04">Hold</span>
+    <span class="badge" style="background:#9ca3af">Available</span>
+  </div>
+</div>
+
+<div id="messages">
+  <div class="bubble assistant">👋 Hi! I'm the Lime Media Scheduling Assistant. Ask me anything about truck availability, holds, commitments, or conflicts. I'll pull live data from Databricks when you send your first message.</div>
+</div>
+
+<div id="suggestions">
+  <button class="suggestion" onclick="ask('Which trucks are available next week?')">Which trucks are available next week?</button>
+  <button class="suggestion" onclick="ask('What is on hold right now?')">What is on hold right now?</button>
+  <button class="suggestion" onclick="ask('Any trucks committed in Texas this month?')">Any trucks committed in Texas this month?</button>
+  <button class="suggestion" onclick="ask('Are there any double bookings?')">Are there any double bookings?</button>
+</div>
+
+<div id="inputbar">
+  <input id="userinput" placeholder="Ask about availability, holds, commitments, conflicts..." onkeydown="if(event.key==='Enter')sendMsg()" />
+  <button id="sendbtn" onclick="sendMsg()">Send</button>
+</div>
+
+<script>
+  const ANTHROPIC_KEY = "YOUR_ANTHROPIC_API_KEY"; // Set this in Vercel env vars as ANTHROPIC_KEY
+  let cache = null;
+  let loadedAt = null;
+  let history = [];
+
+  const SYSTEM = `You are an internal scheduling assistant for Lime Media's truck operations team.
+You answer questions about truck availability, holds, commitments, and scheduling conflicts.
+You will be given current scheduling data as JSON.
+
+STATUS MEANINGS:
+- SCHEDULED_LED (Green, code 3): Truck confirmed and active in a market via LED app
+- COMMITTED_NOT_SET (Red, code 2): Truck locked for a client, not yet in LED app
+- HOLD_TENTATIVE (Yellow, code 1): Tentatively held, not confirmed
+- EMPTY (Grey, code 0): No booking — truck is available
+
+COLOR MAPPING: Green=Scheduled, Yellow=Hold, Red=Committed, Grey=Available
+
+RULES:
+- Always answer from the data provided
+- For availability → display_status = 'EMPTY'
+- For holds → display_status = 'HOLD_TENTATIVE'
+- For committed → display_status = 'COMMITTED_NOT_SET'
+- Format dates as "March 10, 2026"
+- Summarize first, then list specifics
+- Today is ${new Date().toISOString().split("T")[0]}
+- Stay focused on scheduling topics only`;
+
+  function addBubble(text, role) {
+    const el = document.createElement("div");
+    el.className = `bubble ${role}`;
+    el.textContent = text;
+    document.getElementById("messages").appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+    return el;
+  }
+
+  async function fetchData() {
+    const res = await fetch("/api/query", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    return json.rows;
+  }
+
+  async function ask(q) {
+    document.getElementById("userinput").value = q;
+    await sendMsg();
+  }
+
+  async function sendMsg() {
+    const input = document.getElementById("userinput");
+    const btn   = document.getElementById("sendbtn");
+    const q     = input.value.trim();
+    if (!q) return;
+
+    input.value = "";
+    btn.disabled = true;
+    document.getElementById("suggestions").style.display = "none";
+    addBubble(q, "user");
+    history.push({ role: "user", content: q });
+
+    let loadingEl;
+    try {
+      let data = cache;
+      if (!data) {
+        loadingEl = addBubble("⏳ Fetching latest data from Databricks — this takes about 10–15 seconds...", "assistant");
+        data = await fetchData();
+        cache = data;
+        loadedAt = new Date().toLocaleTimeString();
+        document.getElementById("dataStatus").textContent = `Live data · loaded at ${loadedAt}`;
+        loadingEl.remove();
+      }
+
+      const thinkingEl = addBubble("⏳ Thinking...", "assistant");
+
+      const messages = [
+        ...history.slice(0, -1),
+        { role: "user", content: `Scheduling data (JSON):\n${JSON.stringify(data.slice(0, 2500))}\n\nQuestion: ${q}` }
+      ];
+
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: SYSTEM, messages })
+      });
+
+      const json = await res.json();
+      const reply = json.content?.[0]?.text || "Sorry, I couldn't generate a response.";
+      thinkingEl.remove();
+      addBubble(reply, "assistant");
+      history.push({ role: "assistant", content: reply });
+
+    } catch (e) {
+      if (loadingEl) loadingEl.remove();
+      addBubble(`❌ Error: ${e.message}`, "assistant");
+    } finally {
+      btn.disabled = false;
+      input.focus();
+    }
+  }
+</script>
+</body>
+</html>
